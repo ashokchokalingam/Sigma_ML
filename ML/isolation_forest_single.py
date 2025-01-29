@@ -9,6 +9,7 @@ from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.ensemble import IsolationForest
 from sklearn.feature_extraction.text import TfidfVectorizer
 import numpy as np
+from scipy.spatial.distance import euclidean
 from concurrent.futures import ThreadPoolExecutor
 import psutil  # For monitoring system resources
 
@@ -18,7 +19,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 # Database configuration
 db_config = {
     "host": "localhost",
-    "user": "sigma",
+    "user": "root",
     "password": "sigma",
     "database": "sigma_db",
 }
@@ -81,31 +82,52 @@ def preprocess_data(data):
     return combined_data
 
 def run_isolation_forest(data_scaled):
-    """Train Isolation Forest on the complete dataset."""
+    """Train Isolation Forest on the complete dataset and return anomaly scores."""
     isolation_forest = IsolationForest(contamination=0.1, random_state=42)
     isolation_forest.fit(data_scaled)
+
+    # Compute anomaly scores
+    anomaly_scores = isolation_forest.decision_function(data_scaled)
     anomaly_labels = isolation_forest.predict(data_scaled)
 
     # Convert labels: -1 for anomalies, 0 for normal
-    return np.where(anomaly_labels == -1, -1, 0)
+    return np.where(anomaly_labels == -1, -1, 0), anomaly_scores
 
-def categorize_event(row, is_anomaly):
-    """Generate a descriptive ML classification based on the title."""
-    title = row[1].lower()
-    if "powershell" in title:
-        return "Anomalous PowerShell Execution" if is_anomaly else "PowerShell Activity"
-    elif "kerberos" in title:
-        return "Anomalous Kerberos Behavior" if is_anomaly else "Kerberos Activity"
-    elif "suspicious" in title:
-        return "Anomalous Suspicious Behavior" if is_anomaly else "Suspicious Behavior"
-    else:
-        return "Anomaly Detected" if is_anomaly else "General: Unusual Activity"
+def analyze_anomaly_reason(row, data_scaled, i, normal_sample_mean):
+    """Dynamically determine why an event is an anomaly based on feature deviations."""
+    title, user_id, computer_name, event_id = row[1], row[4], row[3], row[6]
+    
+    # Compare the anomaly with the mean of normal samples
+    deviations = []
 
-def update_cluster_labels_and_descriptions(data, anomaly_labels):
-    """Update sigma_alerts with the anomaly labels and ML descriptions."""
+    if euclidean(data_scaled[i], normal_sample_mean) > 0.5:  
+        deviations.append("Significant deviation from normal patterns")
+
+    if title not in normal_sample_mean:
+        deviations.append(f"Rare event title: {title}")
+
+    if user_id not in normal_sample_mean:
+        deviations.append(f"Unusual user activity: {user_id}")
+
+    if computer_name not in normal_sample_mean:
+        deviations.append(f"Unexpected system access: {computer_name}")
+
+    if event_id not in normal_sample_mean:
+        deviations.append(f"Rare event ID observed: {event_id}")
+
+    if not deviations:
+        deviations.append("General anomaly detected")
+
+    return ", ".join(deviations)
+
+def update_cluster_labels_and_descriptions(data, anomaly_labels, anomaly_scores, data_scaled):
+    """Update sigma_alerts with the anomaly labels and dynamic ML descriptions."""
     if len(anomaly_labels) != len(data):
         logging.error("Mismatch between processed data and anomaly labels. Aborting update.")
         return
+
+    # Compute mean vector of normal samples
+    normal_sample_mean = np.mean(data_scaled[anomaly_labels == 0], axis=0)
 
     try:
         connection = mysql.connector.connect(**db_config)
@@ -117,7 +139,11 @@ def update_cluster_labels_and_descriptions(data, anomaly_labels):
         WHERE id = %s
         """
         update_data = [
-            (int(anomaly_labels[i]), categorize_event(data[i], anomaly_labels[i] == -1), data[i][0])
+            (
+                int(anomaly_labels[i]), 
+                analyze_anomaly_reason(data[i], data_scaled, i, normal_sample_mean) if anomaly_labels[i] == -1 else "Normal Behavior",
+                data[i][0]
+            )
             for i in range(len(data))
         ]
         cursor.executemany(update_query, update_data)
@@ -129,16 +155,6 @@ def update_cluster_labels_and_descriptions(data, anomaly_labels):
     finally:
         if connection:
             connection.close()
-
-def determine_batch_size(total_samples):
-    """Determine optimal batch size based on available memory."""
-    mem = psutil.virtual_memory()
-    available_memory = mem.available / (1024 ** 2)  # Convert to MB
-    logging.info(f"Available memory: {available_memory} MB")
-
-    batch_size = min(1000, len(preprocessed_data) // os.cpu_count())
-    logging.info(f"Determined batch size: {batch_size}")
-    return batch_size
 
 def detect_anomalies():
     """Fetch data, process it, train Isolation Forest, and update the database."""
@@ -155,14 +171,14 @@ def detect_anomalies():
     data_scaled = scaler.fit_transform(preprocessed_data)
 
     # Train single Isolation Forest model
-    anomaly_labels = run_isolation_forest(data_scaled)
+    anomaly_labels, anomaly_scores = run_isolation_forest(data_scaled)
 
     end_time = datetime.now()
     duration = (end_time - start_time).total_seconds()
     logging.info(f"Isolation Forest anomaly detection completed in {duration:.2f} seconds.")
 
-    # Update database
-    update_cluster_labels_and_descriptions(data, anomaly_labels)
+    # Update database with anomaly context
+    update_cluster_labels_and_descriptions(data, anomaly_labels, anomaly_scores, data_scaled)
 
 # Run immediately
 detect_anomalies()
