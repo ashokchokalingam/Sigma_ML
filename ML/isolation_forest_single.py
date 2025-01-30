@@ -10,7 +10,6 @@ from sklearn.ensemble import IsolationForest
 from sklearn.feature_extraction.text import TfidfVectorizer
 import numpy as np
 from scipy.spatial.distance import euclidean
-from concurrent.futures import ThreadPoolExecutor
 import psutil  # For monitoring system resources
 
 # Configure logging
@@ -82,51 +81,64 @@ def preprocess_data(data):
     return combined_data
 
 def run_isolation_forest(data_scaled):
-    """Train Isolation Forest on the complete dataset and return anomaly scores."""
+    """Train Isolation Forest on the dataset and return anomaly scores."""
     isolation_forest = IsolationForest(contamination=0.1, random_state=42)
     isolation_forest.fit(data_scaled)
 
-    # Compute anomaly scores
     anomaly_scores = isolation_forest.decision_function(data_scaled)
     anomaly_labels = isolation_forest.predict(data_scaled)
 
-    # Convert labels: -1 for anomalies, 0 for normal
     return np.where(anomaly_labels == -1, -1, 0), anomaly_scores
 
 def analyze_anomaly_reason(row, data_scaled, i, normal_sample_mean):
-    """Dynamically determine why an event is an anomaly based on feature deviations."""
-    title, user_id, computer_name, event_id = row[1], row[4], row[3], row[6]
-    
-    # Compare the anomaly with the mean of normal samples
+    """Generate a dynamic story-style anomaly description."""
+    title, user_id, computer_name, event_id, tags = row[1], row[4], row[3], row[6], row[2]
+    target_user = row[5]
+
     deviations = []
 
-    if euclidean(data_scaled[i], normal_sample_mean) > 0.5:  
-        deviations.append("Significant deviation from normal patterns")
+    if euclidean(data_scaled[i], normal_sample_mean) > 0.5:
+        deviations.append("This event significantly deviates from normal patterns.")
 
     if title not in normal_sample_mean:
-        deviations.append(f"Rare event title: {title}")
+        deviations.append(f"The event '{title}' is rarely seen in this environment.")
 
     if user_id not in normal_sample_mean:
-        deviations.append(f"Unusual user activity: {user_id}")
+        deviations.append(f"The user '{user_id}' has not interacted with this system before.")
 
     if computer_name not in normal_sample_mean:
-        deviations.append(f"Unexpected system access: {computer_name}")
+        deviations.append(f"The computer '{computer_name}' is not typically accessed by this user.")
 
     if event_id not in normal_sample_mean:
-        deviations.append(f"Rare event ID observed: {event_id}")
+        deviations.append(f"This event type (Event ID: {event_id}) is unusual for this user.")
 
-    if not deviations:
-        deviations.append("General anomaly detected")
+    if target_user and target_user not in normal_sample_mean:
+        deviations.append(f"The target user '{target_user}' is not commonly linked to this source.")
 
-    return ", ".join(deviations)
+    # Extract MITRE ATT&CK tactics and techniques
+    mitre_tactics = [tactic for tactic in tags.split(",") if tactic.startswith("TA")]
+    mitre_techniques = [technique for technique in tags.split(",") if technique.startswith("T") and not technique.startswith("TA")]
+
+    tactic_desc = f"This activity aligns with MITRE ATT&CK tactics: {', '.join(mitre_tactics)}." if mitre_tactics else ""
+    technique_desc = f"Techniques involved: {', '.join(mitre_techniques)}." if mitre_techniques else ""
+
+    # Constructing a natural language explanation
+    description = f"An anomaly was detected: '{title}' involving user '{user_id}' on '{computer_name}' with event ID {event_id}."
+    
+    if deviations:
+        description += " " + " ".join(deviations)
+
+    if tactic_desc or technique_desc:
+        description += f" {tactic_desc} {technique_desc}"
+
+    return description.strip()
 
 def update_cluster_labels_and_descriptions(data, anomaly_labels, anomaly_scores, data_scaled):
-    """Update sigma_alerts with the anomaly labels and dynamic ML descriptions."""
+    """Update sigma_alerts with the anomaly labels and descriptions."""
     if len(anomaly_labels) != len(data):
         logging.error("Mismatch between processed data and anomaly labels. Aborting update.")
         return
 
-    # Compute mean vector of normal samples
     normal_sample_mean = np.mean(data_scaled[anomaly_labels == 0], axis=0)
 
     try:
@@ -151,7 +163,7 @@ def update_cluster_labels_and_descriptions(data, anomaly_labels, anomaly_scores,
         logging.info(f"Updated {len(update_data)} records with ML cluster labels and descriptions.")
         cursor.close()
     except Error as e:
-        logging.error(f"Error updating ML cluster labels and descriptions: {e}")
+        logging.error(f"Error updating database: {e}")
     finally:
         if connection:
             connection.close()
@@ -164,26 +176,12 @@ def detect_anomalies():
         return
 
     preprocessed_data = preprocess_data(data)
-    start_time = datetime.now()
+    data_scaled = StandardScaler().fit_transform(preprocessed_data)
 
-    # Scale data
-    scaler = StandardScaler()
-    data_scaled = scaler.fit_transform(preprocessed_data)
-
-    # Train single Isolation Forest model
     anomaly_labels, anomaly_scores = run_isolation_forest(data_scaled)
-
-    end_time = datetime.now()
-    duration = (end_time - start_time).total_seconds()
-    logging.info(f"Isolation Forest anomaly detection completed in {duration:.2f} seconds.")
-
-    # Update database with anomaly context
     update_cluster_labels_and_descriptions(data, anomaly_labels, anomaly_scores, data_scaled)
 
-# Run immediately
 detect_anomalies()
-
-# Schedule every 5 minutes
 schedule.every(5).minutes.do(detect_anomalies)
 
 while True:
